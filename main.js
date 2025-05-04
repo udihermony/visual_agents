@@ -1,14 +1,17 @@
-import { LMStudioClient } from './lmstudio-wrapper.js';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { LMStudioClient } from "./lmstudio-wrapper.js";
 
 class AgentVisualization {
     constructor() {
         this.scene = new THREE.Scene();
         this.camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
         this.agentBoxes = [];
         this.arrows = [];
         this.boxSpacing = 4;
         this.conversationHistory = [];
+        this.selectedBox = null;
         
         // Mouse interaction variables
         this.raycaster = new THREE.Raycaster();
@@ -18,26 +21,92 @@ class AgentVisualization {
         this.plane = new THREE.Plane();
         this.intersection = new THREE.Vector3();
         
+        // Add orbit controls
+        this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.controls.enableDamping = true; // Add smooth damping effect
+        this.controls.dampingFactor = 0.05;
+        this.controls.screenSpacePanning = true; // Allow panning in screen space
+        this.controls.minDistance = 5; // Minimum zoom distance
+        this.controls.maxDistance = 50; // Maximum zoom distance
+        this.controls.maxPolarAngle = Math.PI / 2; // Prevent going below ground
+        this.controls.enablePan = true; // Enable panning
+        this.controls.enableZoom = true; // Enable zooming
+        this.controls.enableRotate = true; // Enable rotation
+        
         this.init();
     }
 
+    // Helper function to draw rounded rectangles
+    roundRect(ctx, x, y, width, height, radius, fill, stroke) {
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.lineTo(x + width - radius, y);
+        ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+        ctx.lineTo(x + width, y + height - radius);
+        ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+        ctx.lineTo(x + radius, y + height);
+        ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+        ctx.lineTo(x, y + radius);
+        ctx.quadraticCurveTo(x, y, x + radius, y);
+        ctx.closePath();
+        if (fill) {
+            ctx.fill();
+        }
+        if (stroke) {
+            ctx.stroke();
+        }
+    }
+
     init() {
-        // Setup renderer
+        // Setup renderer with better quality
         this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(window.devicePixelRatio);
+        this.renderer.shadowMap.enabled = true;
+        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
         document.getElementById('canvas-container').appendChild(this.renderer.domElement);
 
         // Setup camera
-        this.camera.position.z = 10;
-        this.camera.position.y = 2;
+        this.camera.position.z = 15;
+        this.camera.position.y = 5;
+        this.camera.lookAt(0, 0, 0);
 
-        // Add ambient light
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        // Add ambient light for better overall illumination
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.5);
         this.scene.add(ambientLight);
 
-        // Add directional light
-        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
-        directionalLight.position.set(0, 1, 0);
-        this.scene.add(directionalLight);
+        // Add hemisphere light
+        const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
+        hemiLight.position.set(0, 20, 0);
+        this.scene.add(hemiLight);
+
+        // Add directional light with shadows
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.7);
+        dirLight.position.set(-3, 10, -10);
+        dirLight.castShadow = true;
+        dirLight.shadow.mapSize.width = 2048;
+        dirLight.shadow.mapSize.height = 2048;
+        dirLight.shadow.camera.near = 0.5;
+        dirLight.shadow.camera.far = 50;
+        dirLight.shadow.camera.left = -20;
+        dirLight.shadow.camera.right = 20;
+        dirLight.shadow.camera.top = 20;
+        dirLight.shadow.camera.bottom = -20;
+        this.scene.add(dirLight);
+
+        // Add a subtle ground plane
+        const groundGeometry = new THREE.PlaneGeometry(100, 100);
+        const groundMaterial = new THREE.MeshStandardMaterial({
+            color: 0x333333,
+            roughness: 0.8,
+            metalness: 0.2,
+            transparent: true,
+            opacity: 0.5,
+        });
+        const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+        ground.rotation.x = -Math.PI / 2;
+        ground.position.y = -2;
+        ground.receiveShadow = true;
+        this.scene.add(ground);
 
         // Setup event listeners
         window.addEventListener('resize', () => this.onWindowResize());
@@ -53,6 +122,10 @@ class AgentVisualization {
         this.renderer.domElement.addEventListener('mousedown', (e) => this.onMouseDown(e));
         this.renderer.domElement.addEventListener('mousemove', (e) => this.onMouseMove(e));
         this.renderer.domElement.addEventListener('mouseup', () => this.onMouseUp());
+        this.renderer.domElement.addEventListener('click', (e) => this.onClick(e));
+
+        // Initialize object input modal
+        this.initObjectInputModal();
 
         // Start animation loop
         this.animate();
@@ -138,85 +211,112 @@ class AgentVisualization {
         conversationContainer.scrollTop = conversationContainer.scrollHeight;
     }
 
-    createTextCanvas(text, width = 256, height = 128) {
-        const canvas = document.createElement('canvas');
-        const context = canvas.getContext('2d');
-        canvas.width = width;
-        canvas.height = height;
-        
-        // Set background
-        context.fillStyle = 'rgba(0, 0, 0, 0.5)';
-        context.fillRect(0, 0, width, height);
-        
-        // Set text style
-        context.fillStyle = '#ffffff';
-        context.font = '16px Arial';
-        
-        // Word wrap the text
-        const words = text.split(' ');
-        let line = '';
-        let y = 20;
-        const lineHeight = 20;
-        const maxWidth = width - 20;
-        
-        for (let n = 0; n < words.length; n++) {
-            const testLine = line + words[n] + ' ';
-            const metrics = context.measureText(testLine);
-            const testWidth = metrics.width;
+    createTextCanvas(text, label = "", width = 256, height = 160) {
+        const canvas = document.createElement("canvas")
+        const context = canvas.getContext("2d")
+        canvas.width = width
+        canvas.height = height
+
+        // Set background with rounded corners
+        context.fillStyle = "rgba(30, 30, 40, 0.85)"
+        this.roundRect(context, 0, 0, width, height, 10, true, false)
+
+        // Add border
+        context.strokeStyle = "rgba(100, 100, 255, 0.5)"
+        context.lineWidth = 2
+        this.roundRect(context, 0, 0, width, height, 10, false, true)
+
+        // Draw label at the top
+        if (label) {
+            context.fillStyle = "#4a6bff"
+            context.font = "bold 16px Arial"
+            context.fillText(label, 10, 25)
             
+            // Add separator line
+            context.beginPath()
+            context.strokeStyle = "rgba(100, 100, 255, 0.3)"
+            context.moveTo(10, 35)
+            context.lineTo(width - 10, 35)
+            context.stroke()
+        }
+
+        // Set text style for content
+        context.fillStyle = "#ffffff"
+        context.font = "16px Arial"
+
+        // Word wrap the text
+        const words = text.split(" ")
+        let line = ""
+        let y = label ? 55 : 20 // Start content below label if present
+        const lineHeight = 20
+        const maxWidth = width - 20
+
+        for (let n = 0; n < words.length; n++) {
+            const testLine = line + words[n] + " "
+            const metrics = context.measureText(testLine)
+            const testWidth = metrics.width
+
             if (testWidth > maxWidth && n > 0) {
-                context.fillText(line, 10, y);
-                line = words[n] + ' ';
-                y += lineHeight;
+                context.fillText(line, 10, y)
+                line = words[n] + " "
+                y += lineHeight
+
+                // Check if we've run out of vertical space
+                if (y > height - lineHeight) {
+                    context.fillText(line + "...", 10, y)
+                    break
+                }
             } else {
-                line = testLine;
+                line = testLine
             }
         }
-        context.fillText(line, 10, y);
-        
-        return canvas;
+
+        // Add the last line
+        if (y <= height - lineHeight) {
+            context.fillText(line, 10, y)
+        }
+
+        return canvas
     }
 
     createAgentBox(index, label, content) {
-        const geometry = new THREE.BoxGeometry(2, 2, 2);
-        const material = new THREE.MeshPhongMaterial({
-            color: index % 2 === 0 ? 0x4CAF50 : 0x2196F3,
+        // Create a group for the text elements
+        const textGroup = new THREE.Group()
+        
+        // Create single sprite with both label and content
+        const contentCanvas = this.createTextCanvas(content, label)
+        const contentTexture = new THREE.CanvasTexture(contentCanvas)
+        const contentMaterial = new THREE.SpriteMaterial({
+            map: contentTexture,
             transparent: true,
-            opacity: 0.8
-        });
-        const box = new THREE.Mesh(geometry, material);
+        })
+        const contentSprite = new THREE.Sprite(contentMaterial)
+        contentSprite.position.set(0, 0, 0)
+        contentSprite.scale.set(2, 1.25, 1) // Adjusted height to accommodate label
         
-        // Position the box
-        box.position.x = index * this.boxSpacing;
-        box.position.y = 0;
+        // Add sprite to group
+        textGroup.add(contentSprite)
         
-        // Add label
-        const labelCanvas = this.createTextCanvas(label, 256, 64);
-        const labelTexture = new THREE.CanvasTexture(labelCanvas);
-        const labelMaterial = new THREE.SpriteMaterial({ map: labelTexture });
-        const labelSprite = new THREE.Sprite(labelMaterial);
-        labelSprite.position.set(box.position.x, box.position.y + 1.5, box.position.z + 0.51);
-        labelSprite.scale.set(2, 0.5, 1);
-
-        // Add content
-        const contentCanvas = this.createTextCanvas(content);
-        const contentTexture = new THREE.CanvasTexture(contentCanvas);
-        const contentMaterial = new THREE.SpriteMaterial({ map: contentTexture });
-        const contentSprite = new THREE.Sprite(contentMaterial);
-        contentSprite.position.set(box.position.x, box.position.y, box.position.z + 0.51);
-        contentSprite.scale.set(2, 1, 1);
+        // Position the group
+        textGroup.position.x = index * this.boxSpacing
+        textGroup.position.y = 0
         
-        this.scene.add(box);
-        this.scene.add(labelSprite);
-        this.scene.add(contentSprite);
-        this.agentBoxes.push({ box, labelSprite, contentSprite, label, content });
-
+        this.scene.add(textGroup)
+        
+        this.agentBoxes.push({
+            box: textGroup,
+            contentSprite,
+            label,
+            content,
+            isHighlighted: false
+        })
+        
         // Create arrow if this isn't the first box
         if (index > 0) {
-            this.createArrow(index - 1, index);
+            this.createArrow(index - 1, index)
         }
-
-        return box;
+        
+        return textGroup
     }
 
     createArrow(fromIndex, toIndex) {
@@ -255,6 +355,16 @@ class AgentVisualization {
 
     animate() {
         requestAnimationFrame(() => this.animate());
+        
+        // Update controls
+        this.controls.update();
+        
+        // Add subtle floating animation to text boxes
+        this.agentBoxes.forEach((boxData, index) => {
+            const time = Date.now() * 0.001;
+            boxData.box.position.y = Math.sin(time + index) * 0.1;
+        });
+        
         this.renderer.render(this.scene, this.camera);
     }
 
@@ -297,6 +407,61 @@ class AgentVisualization {
             const errorMessage = "Failed to get response from agent";
             this.addMessageToUI('agent', errorMessage);
             this.createAgentBox(this.agentBoxes.length, "Error", errorMessage);
+        }
+    }
+
+    highlightBox(boxData) {
+        // Clear previous highlights
+        this.clearAllHighlights();
+        
+        // Highlight the selected text box
+        boxData.contentSprite.material.opacity = 1;
+        boxData.isHighlighted = true;
+    }
+
+    clearAllHighlights() {
+        this.agentBoxes.forEach((boxData) => {
+            if (boxData.isHighlighted) {
+                boxData.contentSprite.material.opacity = 0.9;
+                boxData.isHighlighted = false;
+            }
+        });
+    }
+
+    initObjectInputModal() {
+        // Create modal elements if they don't exist
+        if (!document.getElementById("object-input-modal")) {
+            const modal = document.createElement("div");
+            modal.id = "object-input-modal";
+            modal.className = "modal";
+
+            modal.innerHTML = `
+                <div class="modal-content">
+                    <span class="close-button">&times;</span>
+                    <h3 id="modal-title">Edit Node</h3>
+                    <div id="input-sources" class="input-sources"></div>
+                    <textarea id="object-input" placeholder="Enter your text..."></textarea>
+                    <button id="submit-object-input">Submit</button>
+                </div>
+            `;
+
+            document.body.appendChild(modal);
+
+            // Add event listeners for modal
+            document.querySelector(".close-button").addEventListener("click", () => {
+                modal.style.display = "none";
+            });
+
+            document.getElementById("submit-object-input").addEventListener("click", () => {
+                this.handleObjectInput();
+            });
+
+            // Close modal when clicking outside
+            window.addEventListener("click", (e) => {
+                if (e.target === modal) {
+                    modal.style.display = "none";
+                }
+            });
         }
     }
 }
